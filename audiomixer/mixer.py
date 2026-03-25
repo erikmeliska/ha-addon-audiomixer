@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Shared AudioMixer — device discovery, stream management,
-dominant mic detection, recording, and level tracking.
-Used by both TUI and Web interfaces.
+Shared AudioMixer with pluggable mixing modes.
+Modes: mix_all, dominant, dugan (more can be added).
 """
 
 import glob
 import os
 import threading
 import time
-from dataclasses import dataclass, field
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import numpy as np
 import soundfile as sf
@@ -21,9 +21,6 @@ CHANNELS = 1
 BLOCKSIZE = 1024
 NOISE_GATE_RMS = 0.005
 DEAD_MIC_BLOCKS = 30
-DOMINANT_RELEASE_RMS = 0.008
-DOMINANT_MIN_HOLD = 0.5
-DOMINANT_SWITCH_RATIO = 1.5
 AUTO_SELECT_KEYWORD = "fifine"
 
 
@@ -39,11 +36,197 @@ class MicState:
     is_dead: bool = False
     below_gate: bool = False
     gain: float = 0.0
+    weight: float = 0.0  # mixing weight (0-1), shown in UI
     _zero_blocks: int = 0
 
 
+# ── Mixing Modes ─────────────────────────────────────────────────
+
+class MixMode(ABC):
+    """Base class for mixing modes."""
+    name: str = "base"
+    label: str = "Base"
+
+    def reset(self):
+        """Called when mode is activated or mics change."""
+        pass
+
+    @abstractmethod
+    def compute_weights(self, mics: dict[int, MicState]) -> dict[int, float]:
+        """Return target weight (0-1) for each mic index.
+        Called from audio callback — must be fast."""
+        ...
+
+    def update_ui_state(self, mics: dict[int, MicState], weights: dict[int, float]):
+        """Update mic UI flags based on computed weights."""
+        for idx, mic in mics.items():
+            w = weights.get(idx, 0)
+            mic.weight = w
+            mic.below_gate = mic.smoothed_rms < NOISE_GATE_RMS and not mic.is_dead
+
+
+class MixAllMode(MixMode):
+    """Simple equal mix — all mics at equal weight."""
+    name = "mix_all"
+    label = "Mix All"
+
+    def compute_weights(self, mics):
+        alive = {idx for idx, m in mics.items() if not m.is_dead}
+        if not alive:
+            return {idx: 0.0 for idx in mics}
+        w = 1.0 / len(alive)
+        return {idx: (w if idx in alive else 0.0) for idx in mics}
+
+    def update_ui_state(self, mics, weights):
+        super().update_ui_state(mics, weights)
+        for mic in mics.values():
+            mic.is_dominant = False
+            mic.is_muted = False
+
+
+class DominantMode(MixMode):
+    """Single dominant mic with hysteresis and hold time."""
+    name = "dominant"
+    label = "Dominant"
+
+    RELEASE_RMS = 0.008
+    MIN_HOLD = 0.5
+    SWITCH_RATIO = 1.5
+
+    def __init__(self):
+        self.dominant_idx = None
+        self._hold_until = 0.0
+
+    def reset(self):
+        self.dominant_idx = None
+        self._hold_until = 0.0
+
+    def compute_weights(self, mics):
+        now = time.monotonic()
+        active = {
+            idx: m.smoothed_rms for idx, m in mics.items()
+            if m.smoothed_rms >= NOISE_GATE_RMS and not m.is_dead
+        }
+
+        if not active:
+            if now >= self._hold_until:
+                self.dominant_idx = None
+        elif self.dominant_idx is None or self.dominant_idx not in active:
+            self.dominant_idx = max(active, key=active.get)
+            self._hold_until = now + self.MIN_HOLD
+        else:
+            current_rms = mics[self.dominant_idx].smoothed_rms
+            loudest = max(active, key=active.get)
+            loudest_rms = active[loudest]
+
+            all_alive = {idx for idx, m in mics.items() if not m.is_dead}
+            above_gate_ratio = len(active) / max(len(all_alive), 1)
+
+            if above_gate_ratio >= 0.5 and loudest != self.dominant_idx:
+                if loudest_rms > current_rms * 1.3:
+                    self.dominant_idx = loudest
+                    self._hold_until = now + self.MIN_HOLD
+            else:
+                dom_speaking = current_rms >= self.RELEASE_RMS
+                if dom_speaking:
+                    self._hold_until = now + self.MIN_HOLD
+                elif now >= self._hold_until:
+                    if loudest != self.dominant_idx and loudest_rms > current_rms * self.SWITCH_RATIO:
+                        self.dominant_idx = loudest
+                        self._hold_until = now + self.MIN_HOLD
+                    elif current_rms < NOISE_GATE_RMS:
+                        self.dominant_idx = loudest if active else None
+
+        weights = {}
+        for idx in mics:
+            if self.dominant_idx is None:
+                weights[idx] = 0.0
+            elif idx == self.dominant_idx:
+                weights[idx] = 1.0
+            else:
+                weights[idx] = 0.0
+        return weights
+
+    def update_ui_state(self, mics, weights):
+        super().update_ui_state(mics, weights)
+        for idx, mic in mics.items():
+            below = mic.smoothed_rms < NOISE_GATE_RMS
+            mic.is_dominant = (idx == self.dominant_idx) and not below and not mic.is_dead
+            mic.is_muted = (idx != self.dominant_idx) and not below and not mic.is_dead
+
+
+class DuganMode(MixMode):
+    """Dugan automixing — gain proportional to energy squared.
+
+    weight_i = rms_i² / Σ(rms_j²)
+
+    Mics closer to the speaker get higher weight naturally.
+    Echo/distant mics get attenuated without hard switching.
+    Total gain is always normalized to 1.0.
+    """
+    name = "dugan"
+    label = "Dugan Automix"
+
+    def compute_weights(self, mics):
+        weights = {}
+        alive = {idx: m for idx, m in mics.items() if not m.is_dead}
+
+        if not alive:
+            return {idx: 0.0 for idx in mics}
+
+        # Use smoothed RMS² for stability
+        energies = {}
+        for idx, m in alive.items():
+            rms = m.smoothed_rms
+            # Apply noise gate: below gate → energy = 0
+            if rms < NOISE_GATE_RMS:
+                energies[idx] = 0.0
+            else:
+                energies[idx] = rms ** 2
+
+        total_energy = sum(energies.values())
+
+        if total_energy < 1e-20:
+            # Everyone below gate — equal low weight
+            w = 1.0 / len(alive)
+            for idx in mics:
+                weights[idx] = w if idx in alive else 0.0
+        else:
+            for idx in mics:
+                if idx in alive:
+                    weights[idx] = energies[idx] / total_energy
+                else:
+                    weights[idx] = 0.0
+
+        return weights
+
+    def update_ui_state(self, mics, weights):
+        super().update_ui_state(mics, weights)
+        # In Dugan, dominant = highest weight, muted = weight < 10%
+        if not weights:
+            return
+        max_w = max(weights.values()) if weights else 0
+        for idx, mic in mics.items():
+            w = weights.get(idx, 0)
+            mic.is_dominant = (w == max_w and w > 0.3) and not mic.is_dead
+            mic.is_muted = (w < 0.1) and not mic.is_dead and not mic.below_gate
+
+
+# ── Mode registry ────────────────────────────────────────────────
+
+MIXING_MODES: dict[str, type[MixMode]] = {
+    "mix_all": MixAllMode,
+    "dominant": DominantMode,
+    "dugan": DuganMode,
+}
+
+GAIN_SMOOTHING = 0.15  # how fast gain transitions (per block)
+
+
+# ── AudioMixer ───────────────────────────────────────────────────
+
 class AudioMixer:
-    """Core audio mixer with dominant mic detection."""
+    """Core audio mixer with pluggable mixing modes."""
 
     def __init__(self, recordings_dir: str = "."):
         self.backend = AudioBackend()
@@ -56,19 +239,43 @@ class AudioMixer:
 
         self.is_live = False
         self.is_recording = False
-        self.dominant_mode = False
-        self.dominant_idx: int | None = None
+
+        # Mixing mode
+        self._modes: dict[str, MixMode] = {
+            name: cls() for name, cls in MIXING_MODES.items()
+        }
+        self._current_mode_name = "dugan"  # default
+        self._mode: MixMode = self._modes[self._current_mode_name]
 
         self._record_buffers: dict[int, list] = {}
         self._record_start_time: float = 0
-        self._rms_per_block: dict[int, float] = {}
-        self._dominant_hold_until: float = 0
 
         self._lock = threading.Lock()
-        self._listeners: list = []  # callbacks for state changes
+        self._listeners: list = []
+
+    @property
+    def mode_name(self) -> str:
+        return self._current_mode_name
+
+    @property
+    def available_modes(self) -> list[dict]:
+        return [{"name": name, "label": cls.label} for name, cls in MIXING_MODES.items()]
+
+    def set_mode(self, mode_name: str):
+        if mode_name not in self._modes:
+            return
+        self._current_mode_name = mode_name
+        self._mode = self._modes[mode_name]
+        self._mode.reset()
+        # Reset mic UI state
+        for mic in self.mics.values():
+            mic.is_dominant = False
+            mic.is_muted = False
+            mic.gain = 0.0
+            mic.weight = 0.0
+        self._notify("mode_changed", {"mode": mode_name})
 
     def add_listener(self, callback):
-        """Add a callback(event, data) for state change notifications."""
         self._listeners.append(callback)
 
     def _notify(self, event: str, data=None):
@@ -86,7 +293,6 @@ class AudioMixer:
         return [d for d in self.devices if AUTO_SELECT_KEYWORD in d.name.lower()]
 
     def start(self, device_indices: list[int] | None = None):
-        """Start monitoring selected devices."""
         if self.is_live:
             self.stop()
 
@@ -103,9 +309,10 @@ class AudioMixer:
         for dev in selected:
             self.mics[dev.index] = MicState(device=dev)
             self._record_buffers[dev.index] = []
-            self._rms_per_block[dev.index] = 0.0
 
+        self._mode.reset()
         self.is_live = True
+
         for dev in selected:
             stream = self.backend.open_stream(dev, self._make_callback(dev.index))
             stream.start()
@@ -114,7 +321,6 @@ class AudioMixer:
         self._notify("started")
 
     def stop(self):
-        """Stop all streams."""
         self.is_live = False
         if self.is_recording:
             self.stop_recording()
@@ -125,7 +331,6 @@ class AudioMixer:
             except Exception:
                 pass
         self.streams.clear()
-        self.dominant_idx = None
         self._notify("stopped")
 
     def start_recording(self):
@@ -146,15 +351,6 @@ class AudioMixer:
         self._notify("recording_stopped", {"path": path, "duration": elapsed})
         return path
 
-    def toggle_dominant(self):
-        self.dominant_mode = not self.dominant_mode
-        if not self.dominant_mode:
-            self.dominant_idx = None
-            for mic in self.mics.values():
-                mic.is_dominant = False
-                mic.is_muted = False
-        self._notify("dominant_toggled", {"enabled": self.dominant_mode})
-
     def get_status(self) -> dict:
         mics_data = []
         for idx, mic in self.mics.items():
@@ -168,12 +364,14 @@ class AudioMixer:
                 "is_muted": mic.is_muted,
                 "is_dead": mic.is_dead,
                 "below_gate": mic.below_gate,
+                "weight": round(mic.weight, 3),
             })
         return {
             "is_live": self.is_live,
             "is_recording": self.is_recording,
-            "dominant_mode": self.dominant_mode,
-            "dominant_idx": self.dominant_idx,
+            "mode": self._current_mode_name,
+            "mode_label": self._mode.label,
+            "available_modes": self.available_modes,
             "recording_duration": (time.time() - self._record_start_time) if self.is_recording else 0,
             "mics": mics_data,
         }
@@ -204,7 +402,7 @@ class AudioMixer:
         except OSError:
             return False
 
-    # ── Internal ─────────────────────────────────────────────────────
+    # ── Internal ─────────────────────────────────────────────────
 
     def _make_callback(self, dev_idx: int):
         def callback(indata, frames, time_info, status):
@@ -217,7 +415,6 @@ class AudioMixer:
                 return
 
             mic.level = scaled
-            self._rms_per_block[dev_idx] = rms
 
             # Dead mic detection
             if rms < 1e-10:
@@ -226,82 +423,24 @@ class AudioMixer:
                 mic._zero_blocks = 0
             mic.is_dead = mic._zero_blocks >= DEAD_MIC_BLOCKS
 
-            # Smooth RMS (EMA)
+            # Smooth RMS (EMA: fast attack, slow release)
             alpha = 0.3 if rms > mic.smoothed_rms else 0.05
             mic.smoothed_rms = alpha * rms + (1 - alpha) * mic.smoothed_rms
 
             if scaled > mic.peak:
                 mic.peak = scaled
 
-            # Dominant mic determination
-            if self.dominant_mode:
-                self._update_dominant(dev_idx)
+            # Compute mixing weights via current mode
+            weights = self._mode.compute_weights(self.mics)
+            self._mode.update_ui_state(self.mics, weights)
 
-            # Update UI state
-            below_gate = mic.smoothed_rms < NOISE_GATE_RMS
-            mic.below_gate = below_gate and not mic.is_dead
-            if self.dominant_mode and not mic.is_dead:
-                mic.is_dominant = (dev_idx == self.dominant_idx) and not below_gate
-                mic.is_muted = (dev_idx != self.dominant_idx) and not below_gate
-            else:
-                mic.is_dominant = False
-                mic.is_muted = False
-
-            # Recording
+            # Recording: apply smoothed gain
             if self.is_recording:
-                if self.dominant_mode:
-                    if self.dominant_idx is None:
-                        target = 0.0
-                    elif dev_idx == self.dominant_idx:
-                        target = 1.0
-                    else:
-                        target = 0.0
-                    mic.gain = mic.gain + 0.15 * (target - mic.gain)
-                    self._record_buffers[dev_idx].append(mono * mic.gain)
-                else:
-                    self._record_buffers[dev_idx].append(mono.copy())
+                target = weights.get(dev_idx, 0.0)
+                mic.gain += GAIN_SMOOTHING * (target - mic.gain)
+                self._record_buffers[dev_idx].append(mono * mic.gain)
 
         return callback
-
-    def _update_dominant(self, dev_idx: int):
-        now = time.monotonic()
-        active_rms = {
-            idx: mic.smoothed_rms
-            for idx, mic in self.mics.items()
-            if mic.smoothed_rms >= NOISE_GATE_RMS and not mic.is_dead
-        }
-
-        current_dom = self.dominant_idx
-
-        if not active_rms:
-            if now >= self._dominant_hold_until:
-                self.dominant_idx = None
-        elif current_dom is None or current_dom not in {m.device.index for m in self.mics.values()}:
-            loudest = max(active_rms, key=active_rms.get)
-            self.dominant_idx = loudest
-            self._dominant_hold_until = now + DOMINANT_MIN_HOLD
-        else:
-            current_rms_val = self.mics[current_dom].smoothed_rms if current_dom in self.mics else 0
-            loudest = max(active_rms, key=active_rms.get)
-            loudest_rms = active_rms[loudest]
-
-            all_alive = {idx for idx, mic in self.mics.items() if not mic.is_dead}
-            above_gate_ratio = len(active_rms) / max(len(all_alive), 1)
-
-            if above_gate_ratio >= 0.5 and loudest != current_dom:
-                if loudest_rms > current_rms_val * 1.3:
-                    self.dominant_idx = loudest
-                    self._dominant_hold_until = now + DOMINANT_MIN_HOLD
-            else:
-                dom_still_speaking = current_rms_val >= DOMINANT_RELEASE_RMS
-                if dom_still_speaking:
-                    self._dominant_hold_until = now + DOMINANT_MIN_HOLD
-                elif now >= self._dominant_hold_until:
-                    if loudest != current_dom and loudest_rms > current_rms_val * DOMINANT_SWITCH_RATIO:
-                        self.dominant_idx = loudest
-                        self._dominant_hold_until = now + DOMINANT_MIN_HOLD
-                    elif current_rms_val < NOISE_GATE_RMS:
-                        self.dominant_idx = loudest if active_rms else None
 
     def _save_recording(self, elapsed: float) -> str | None:
         all_arrays = {}
@@ -320,8 +459,8 @@ class AudioMixer:
             padded = np.zeros(max_len, dtype=np.float32)
             padded[:len(arr)] = arr
             mixed += padded
-        mixed /= len(all_arrays)
 
+        # Normalize (weights already sum to ~1, but normalize for safety)
         peak = np.max(np.abs(mixed))
         if peak > 0:
             mixed = mixed / peak * 0.95
@@ -332,6 +471,5 @@ class AudioMixer:
         return output_path
 
     def decay_peaks(self):
-        """Call periodically to decay peak indicators."""
         for mic in self.mics.values():
             mic.peak = max(mic.peak * 0.95, mic.level)

@@ -87,22 +87,23 @@
 
         // ── Volume Meter ───────────────────────────────────────────
 
-        function VolumeMeter({ mic, dominant_mode }) {
+        function VolumeMeter({ mic, mode }) {
             const barWidth = 100;
             const level = Math.min(mic.level * barWidth, barWidth);
             const peak = Math.min(mic.peak * barWidth, barWidth);
             const db = mic.level > 0.001 ? (20 * Math.log10(mic.level / 10)).toFixed(0) : "-∞";
+            const weightPct = Math.round((mic.weight || 0) * 100);
 
             let barColor = "bg-emerald-500";
             if (mic.is_dead) barColor = "bg-red-900";
-            else if (mic.is_muted || mic.below_gate) barColor = "bg-zinc-600";
+            else if (mic.is_muted || mic.below_gate) barColor = "bg-zinc-400";
             else if (mic.level > 0.85) barColor = "bg-red-500";
             else if (mic.level > 0.6) barColor = "bg-yellow-500";
 
             let statusBadge = null;
             if (mic.is_dead) statusBadge = <Badge variant="destructive">NO SIGNAL</Badge>;
             else if (mic.is_dominant) statusBadge = <Badge className="bg-cyan-600 text-white">ACTIVE</Badge>;
-            else if (mic.is_muted && dominant_mode) statusBadge = <Badge variant="secondary">muted</Badge>;
+            else if (mic.is_muted) statusBadge = <Badge variant="secondary">muted</Badge>;
             else if (mic.below_gate) statusBadge = <Badge variant="outline">gate</Badge>;
 
             return (
@@ -111,16 +112,22 @@
                         <div className="flex items-center gap-2">
                             {mic.is_dominant && <span className="w-2 h-2 rounded-full bg-cyan-400 rec-pulse" />}
                             {mic.is_dead && <span className="w-2 h-2 rounded-full bg-red-500" />}
-                            {!mic.is_dominant && !mic.is_dead && <span className="w-2 h-2 rounded-full bg-zinc-600" />}
+                            {!mic.is_dominant && !mic.is_dead && <span className="w-2 h-2 rounded-full bg-zinc-400" />}
                             <span className="font-medium text-sm">{mic.name}</span>
                             <span className="text-xs text-muted-foreground">#{mic.index}</span>
                         </div>
                         <div className="flex items-center gap-2">
                             {statusBadge}
+                            {mode !== "mix_all" && (
+                                <span className={`text-xs font-mono w-10 text-right ${weightPct > 50 ? "text-emerald-600 font-semibold" : "text-muted-foreground"}`}>
+                                    {weightPct}%
+                                </span>
+                            )}
                             <span className="text-xs text-muted-foreground font-mono w-16 text-right">{db} dB</span>
                         </div>
                     </div>
-                    <div className="relative h-3 bg-zinc-200 rounded-full overflow-hidden">
+                    {/* Volume bar */}
+                    <div className="relative h-2.5 bg-zinc-200 rounded-full overflow-hidden">
                         <div
                             className={`absolute inset-y-0 left-0 rounded-full transition-all duration-75 ${barColor}`}
                             style={{ width: `${level}%` }}
@@ -132,6 +139,15 @@
                             />
                         )}
                     </div>
+                    {/* Weight bar (shown for dugan/dominant) */}
+                    {mode !== "mix_all" && (
+                        <div className="relative h-1.5 bg-zinc-100 rounded-full overflow-hidden mt-1">
+                            <div
+                                className="absolute inset-y-0 left-0 rounded-full bg-cyan-400 transition-all duration-150"
+                                style={{ width: `${weightPct}%` }}
+                            />
+                        </div>
+                    )}
                 </Card>
             );
         }
@@ -260,21 +276,29 @@
                 };
             }, [loadRecordings, connectWs, pollStatus]);
 
-            const send = async (action) => {
+            const send = async (action, data = {}) => {
+                const payload = { action, ...data };
                 if (wsRef.current?.readyState === WebSocket.OPEN) {
-                    wsRef.current.send(JSON.stringify({ action }));
+                    wsRef.current.send(JSON.stringify(payload));
                 } else {
                     // Fallback: use REST API
                     const endpoints = {
-                        record_start: "/api/record/start",
-                        record_stop: "/api/record/stop",
-                        toggle_dominant: "/api/dominant/toggle",
+                        record_start: ["/api/record/start", {}],
+                        record_stop: ["/api/record/stop", {}],
+                        set_mode: ["/api/mode", { mode: data.mode }],
                     };
-                    if (endpoints[action]) {
-                        await fetch(apiUrl(endpoints[action]), { method: "POST" });
+                    const ep = endpoints[action];
+                    if (ep) {
+                        await fetch(apiUrl(ep[0]), {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify(ep[1]),
+                        });
                     }
                 }
             };
+
+            const setMode = (mode) => send("set_mode", { mode });
 
             const deleteRecording = async (filename) => {
                 await fetch(apiUrl(`/api/recordings/${filename}`), { method: "DELETE" });
@@ -336,8 +360,9 @@
                     {/* Live tab */}
                     {tab === "live" && status && (
                         <div>
-                            {/* Controls */}
-                            <div className="flex gap-2 mb-6">
+                            {/* Controls row */}
+                            <div className="flex flex-wrap items-center gap-3 mb-6">
+                                {/* Record button */}
                                 {!status.is_recording ? (
                                     <Button onClick={() => send("record_start")} className="gap-2">
                                         <span className="w-2.5 h-2.5 rounded-full bg-red-500" />
@@ -349,22 +374,24 @@
                                         Stop & Save
                                     </Button>
                                 )}
-                                <Button
-                                    variant={status.dominant_mode ? "default" : "outline"}
-                                    onClick={() => send("toggle_dominant")}
-                                >
-                                    {status.dominant_mode ? "Dominant: ON" : "Dominant: OFF"}
-                                </Button>
-                            </div>
 
-                            {/* Mode indicator */}
-                            <div className="flex items-center gap-2 mb-4">
-                                <span className="text-xs text-muted-foreground">Mode:</span>
-                                {status.dominant_mode ? (
-                                    <Badge className="bg-cyan-900 text-cyan-300">DOMINANT MIC</Badge>
-                                ) : (
-                                    <Badge variant="secondary">MIX ALL</Badge>
-                                )}
+                                {/* Mode selector */}
+                                <div className="flex gap-1 p-1 bg-secondary rounded-lg">
+                                    {(status.available_modes || []).map((m) => (
+                                        <button
+                                            key={m.name}
+                                            onClick={() => setMode(m.name)}
+                                            className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                                                status.mode === m.name
+                                                    ? "bg-background text-foreground shadow-sm"
+                                                    : "text-muted-foreground hover:text-foreground"
+                                            }`}
+                                        >
+                                            {m.label}
+                                        </button>
+                                    ))}
+                                </div>
+
                                 {status.mics?.some(m => m.is_dead) && (
                                     <Badge variant="destructive">
                                         {status.mics.filter(m => m.is_dead).length} dead
@@ -378,7 +405,7 @@
                                     <VolumeMeter
                                         key={mic.index}
                                         mic={mic}
-                                        dominant_mode={status.dominant_mode}
+                                        mode={status.mode}
                                     />
                                 ))}
                             </div>

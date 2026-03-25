@@ -54,9 +54,11 @@ class WebApp:
         path = self.mixer.stop_recording()
         return web.json_response({"ok": True, "path": path})
 
-    async def api_dominant_toggle(self, request):
-        self.mixer.toggle_dominant()
-        return web.json_response({"ok": True, "dominant_mode": self.mixer.dominant_mode})
+    async def api_set_mode(self, request):
+        data = await request.json()
+        mode = data.get("mode", "mix_all")
+        self.mixer.set_mode(mode)
+        return web.json_response({"ok": True, "mode": self.mixer.mode_name})
 
     async def api_select_devices(self, request):
         data = await request.json()
@@ -103,8 +105,8 @@ class WebApp:
                             self.mixer.start_recording()
                         elif action == "record_stop":
                             self.mixer.stop_recording()
-                        elif action == "toggle_dominant":
-                            self.mixer.toggle_dominant()
+                        elif action == "set_mode":
+                            self.mixer.set_mode(data.get("mode", "mix_all"))
                     except json.JSONDecodeError:
                         pass
                 elif msg.type == web.WSMsgType.ERROR:
@@ -151,7 +153,7 @@ def create_app():
     app.router.add_get("/api/devices", app_instance.api_devices)
     app.router.add_post("/api/record/start", app_instance.api_record_start)
     app.router.add_post("/api/record/stop", app_instance.api_record_stop)
-    app.router.add_post("/api/dominant/toggle", app_instance.api_dominant_toggle)
+    app.router.add_post("/api/mode", app_instance.api_set_mode)
     app.router.add_post("/api/devices/select", app_instance.api_select_devices)
     app.router.add_get("/api/recordings", app_instance.api_recordings)
     app.router.add_get("/api/recordings/{filename}", app_instance.api_recording_file)
