@@ -175,31 +175,30 @@
 
         // ── Main App ───────────────────────────────────────────────
 
+        // ── URL helpers (global, used by all components) ─────────
+        function getBasePath() {
+            const path = location.pathname;
+            if (path.includes("ingress")) {
+                return path.replace(/\/+$/, "");
+            }
+            return "";
+        }
+
+        function apiUrl(endpoint) {
+            return getBasePath() + endpoint;
+        }
+
+        function wsUrl() {
+            const proto = location.protocol === "https:" ? "wss:" : "ws:";
+            return `${proto}//${location.host}${getBasePath()}/ws`;
+        }
+
         function App() {
             const [status, setStatus] = useState(null);
             const [recordings, setRecordings] = useState([]);
             const [tab, setTab] = useState("live");
             const [connected, setConnected] = useState(false);
             const wsRef = useRef(null);
-
-            // Detect base path (HA Ingress uses /api/hassio_ingress/xxx/)
-            function getBasePath() {
-                const path = location.pathname;
-                // If accessed via ingress, strip trailing /index.html or /
-                if (path.includes("ingress")) {
-                    return path.replace(/\/+$/, "");
-                }
-                return "";
-            }
-
-            function apiUrl(endpoint) {
-                return getBasePath() + endpoint;
-            }
-
-            function wsUrl() {
-                const proto = location.protocol === "https:" ? "wss:" : "ws:";
-                return `${proto}//${location.host}${getBasePath()}/ws`;
-            }
 
             const loadRecordings = useCallback(async () => {
                 try {
