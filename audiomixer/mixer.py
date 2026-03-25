@@ -156,16 +156,19 @@ class DominantMode(MixMode):
 
 
 class DuganMode(MixMode):
-    """Dugan automixing — gain proportional to energy squared.
+    """Dugan automixing — gain proportional to energy.
 
-    weight_i = rms_i² / Σ(rms_j²)
+    weight_i = rms_i^n / Σ(rms_j^n)
 
-    Mics closer to the speaker get higher weight naturally.
-    Echo/distant mics get attenuated without hard switching.
-    Total gain is always normalized to 1.0.
+    Higher exponent = sharper focus on loudest mic.
+    n=2: gentle (original Dugan), n=6: sharp (reduces phase between mics).
     """
     name = "dugan"
     label = "Dugan Automix"
+
+    # Exponent controls focus sharpness:
+    # 2 = classic Dugan (gentle), 4 = moderate, 6 = sharp, 8 = very sharp
+    EXPONENT = 6
 
     def compute_weights(self, mics):
         weights = {}
@@ -174,20 +177,17 @@ class DuganMode(MixMode):
         if not alive:
             return {idx: 0.0 for idx in mics}
 
-        # Use smoothed RMS² for stability
         energies = {}
         for idx, m in alive.items():
             rms = m.smoothed_rms
-            # Apply noise gate: below gate → energy = 0
             if rms < NOISE_GATE_RMS:
                 energies[idx] = 0.0
             else:
-                energies[idx] = rms ** 2
+                energies[idx] = rms ** self.EXPONENT
 
         total_energy = sum(energies.values())
 
-        if total_energy < 1e-20:
-            # Everyone below gate — equal low weight
+        if total_energy < 1e-30:
             w = 1.0 / len(alive)
             for idx in mics:
                 weights[idx] = w if idx in alive else 0.0
@@ -212,12 +212,21 @@ class DuganMode(MixMode):
             mic.is_muted = (w < 0.1) and not mic.is_dead and not mic.below_gate
 
 
+class DuganSharpMode(DuganMode):
+    """Dugan with very high exponent — nearly single-mic selection
+    but with smooth transitions instead of hard switching."""
+    name = "dugan_sharp"
+    label = "Dugan Sharp"
+    EXPONENT = 12
+
+
 # ── Mode registry ────────────────────────────────────────────────
 
 MIXING_MODES: dict[str, type[MixMode]] = {
     "mix_all": MixAllMode,
     "dominant": DominantMode,
     "dugan": DuganMode,
+    "dugan_sharp": DuganSharpMode,
 }
 
 GAIN_SMOOTHING = 0.15  # how fast gain transitions (per block)
