@@ -1,13 +1,18 @@
-#!/bin/sh
+#!/usr/bin/with-contenv bashio
+# shellcheck shell=bash
 set -e
 
-echo "=== Audio Mixer Add-on ==="
-echo "Recordings dir: ${RECORDINGS_DIR:-/share/audiomixer}"
-mkdir -p "${RECORDINGS_DIR:-/share/audiomixer}"
+bashio::log.info "=== Audio Mixer Add-on ==="
+
+export RECORDINGS_DIR="${RECORDINGS_DIR:-/share/audiomixer}"
+export WEB_PORT="${WEB_PORT:-8099}"
+
+bashio::log.info "Recordings dir: ${RECORDINGS_DIR}"
+mkdir -p "${RECORDINGS_DIR}"
 
 # Activate PulseAudio sources (unmute + set volume)
-echo "Activating PulseAudio sources..."
-sleep 2  # wait for PA to be ready
+bashio::log.info "Activating PulseAudio sources..."
+sleep 2
 
 for src in $(pactl list sources short 2>/dev/null | grep -v monitor | awk '{print $2}'); do
     pactl set-source-mute "$src" 0 2>/dev/null || true
@@ -15,9 +20,8 @@ for src in $(pactl list sources short 2>/dev/null | grep -v monitor | awk '{prin
     pactl suspend-source "$src" 1 2>/dev/null || true
     sleep 0.1
     pactl suspend-source "$src" 0 2>/dev/null || true
-    echo "  Activated: $src"
+    bashio::log.info "  Activated: $src"
 done
 
-echo ""
-echo "Starting Web UI on port ${WEB_PORT:-8099}..."
+bashio::log.info "Starting Web UI on port ${WEB_PORT}..."
 exec python3 /app/web_app.py

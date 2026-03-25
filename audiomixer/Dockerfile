@@ -16,7 +16,7 @@ RUN apk add --no-cache \
     python3-dev \
     musl-dev
 
-# PulseAudio client config — connect to HA audio container
+# PulseAudio client config
 RUN mkdir -p /etc/pulse && \
     echo "default-server = unix:/run/pulse/native" > /etc/pulse/client.conf && \
     echo "autospawn = no" >> /etc/pulse/client.conf && \
@@ -29,10 +29,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
 
-COPY audio_backend.py mixer.py web_app.py tui.py mix_mics.py run.sh ./
+COPY audio_backend.py mixer.py web_app.py tui.py mix_mics.py ./
 COPY static/ ./static/
 
-# s6-overlay service — this is how HA add-ons run long-lived processes
-RUN mkdir -p /etc/services.d/audiomixer
-COPY run_s6.sh /etc/services.d/audiomixer/run
-RUN chmod +x /etc/services.d/audiomixer/run /app/run.sh
+COPY run.sh /
+RUN chmod +x /run.sh
+CMD ["/run.sh"]
