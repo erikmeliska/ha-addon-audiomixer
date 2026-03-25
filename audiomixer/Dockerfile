@@ -32,4 +32,7 @@ RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
 COPY audio_backend.py mixer.py web_app.py tui.py mix_mics.py run.sh ./
 COPY static/ ./static/
 
-RUN chmod +x run.sh
+# s6-overlay service — this is how HA add-ons run long-lived processes
+RUN mkdir -p /etc/services.d/audiomixer
+COPY run_s6.sh /etc/services.d/audiomixer/run
+RUN chmod +x /etc/services.d/audiomixer/run /app/run.sh
