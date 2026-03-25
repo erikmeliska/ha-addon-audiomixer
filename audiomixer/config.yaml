@@ -1,6 +1,6 @@
 name: "Audio Mixer"
 description: "Mix multiple USB microphones with live monitoring, dominant mic detection, and recording. Web UI with real-time volume meters."
-version: "1.3.0"
+version: "1.4.0"
 slug: "audiomixer"
 url: "https://github.com/erikmeliska/ha-addon-audiomixer"
 arch:

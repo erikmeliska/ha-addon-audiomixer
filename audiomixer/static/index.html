@@ -87,12 +87,14 @@
 
         // ── Volume Meter ───────────────────────────────────────────
 
-        function VolumeMeter({ mic, mode }) {
+        function VolumeMeter({ mic, mode, onVolumeChange }) {
+            const [showVolume, setShowVolume] = useState(false);
             const barWidth = 100;
             const level = Math.min(mic.level * barWidth, barWidth);
             const peak = Math.min(mic.peak * barWidth, barWidth);
             const db = mic.level > 0.001 ? (20 * Math.log10(mic.level / 10)).toFixed(0) : "-∞";
             const weightPct = Math.round((mic.weight || 0) * 100);
+            const corrPct = Math.round((mic.correlation || 0) * 100);
 
             let barColor = "bg-emerald-500";
             if (mic.is_dead) barColor = "bg-red-900";
@@ -106,6 +108,14 @@
             else if (mic.is_muted) statusBadge = <Badge variant="secondary">muted</Badge>;
             else if (mic.below_gate) statusBadge = <Badge variant="outline">gate</Badge>;
 
+            // Correlation badge for smart mode
+            let corrBadge = null;
+            if (mode === "smart" && !mic.is_dominant && !mic.below_gate && !mic.is_dead && corrPct > 0) {
+                if (corrPct > 60) corrBadge = <Badge className="bg-orange-100 text-orange-700 text-[10px]">echo {corrPct}%</Badge>;
+                else if (corrPct > 30) corrBadge = <Badge className="bg-yellow-100 text-yellow-700 text-[10px]">~{corrPct}%</Badge>;
+                else corrBadge = <Badge className="bg-green-100 text-green-700 text-[10px]">indep</Badge>;
+            }
+
             return (
                 <Card className="p-4 animate-in">
                     <div className="flex items-center justify-between mb-2">
@@ -113,14 +123,12 @@
                             {mic.is_dominant && <span className="w-2 h-2 rounded-full bg-cyan-400 rec-pulse" />}
                             {mic.is_dead && <span className="w-2 h-2 rounded-full bg-red-500" />}
                             {!mic.is_dominant && !mic.is_dead && <span className="w-2 h-2 rounded-full bg-zinc-400" />}
-                            <span className="font-medium text-sm">{mic.name}</span>
+                            <span className="font-medium text-sm cursor-pointer hover:underline" onClick={() => setShowVolume(!showVolume)}>{mic.name}</span>
                             <span className="text-xs text-muted-foreground">#{mic.index}</span>
+                            {corrBadge}
                         </div>
                         <div className="flex items-center gap-2">
                             {statusBadge}
-                            {mode === "dugan_aligned" && mic.delay !== 0 && (
-                                <span className="text-xs font-mono text-violet-500">{mic.delay > 0 ? "+" : ""}{mic.delay}s</span>
-                            )}
                             {mode !== "mix_all" && (
                                 <span className={`text-xs font-mono w-10 text-right ${weightPct > 50 ? "text-emerald-600 font-semibold" : "text-muted-foreground"}`}>
                                     {weightPct}%
@@ -142,13 +150,28 @@
                             />
                         )}
                     </div>
-                    {/* Weight bar (shown for dugan/dominant) */}
+                    {/* Weight bar */}
                     {mode !== "mix_all" && (
                         <div className="relative h-1.5 bg-zinc-100 rounded-full overflow-hidden mt-1">
                             <div
                                 className="absolute inset-y-0 left-0 rounded-full bg-cyan-400 transition-all duration-150"
                                 style={{ width: `${weightPct}%` }}
                             />
+                        </div>
+                    )}
+                    {/* Mic gain slider */}
+                    {showVolume && mic.source_name && (
+                        <div className="flex items-center gap-2 mt-2 pt-2 border-t border-zinc-100">
+                            <span className="text-xs text-muted-foreground w-16">Mic gain:</span>
+                            <input
+                                type="range"
+                                min="0"
+                                max="150"
+                                defaultValue="100"
+                                className="flex-1 h-1.5 accent-emerald-500"
+                                onChange={(e) => onVolumeChange(mic.source_name, parseInt(e.target.value))}
+                            />
+                            <span className="text-xs text-muted-foreground w-8">{mic.source_name ? "" : ""}</span>
                         </div>
                     )}
                 </Card>
@@ -409,6 +432,13 @@
                                         key={mic.index}
                                         mic={mic}
                                         mode={status.mode}
+                                        onVolumeChange={async (source, vol) => {
+                                            await fetch(apiUrl("/api/mic/volume"), {
+                                                method: "POST",
+                                                headers: {"Content-Type": "application/json"},
+                                                body: JSON.stringify({source_name: source, volume: vol}),
+                                            });
+                                        }}
                                     />
                                 ))}
                             </div>
