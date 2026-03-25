@@ -34,4 +34,7 @@ COPY static/ ./static/
 
 COPY run.sh /
 RUN chmod +x /run.sh
+
+# Override the base image entrypoint — skip s6-overlay entirely
+ENTRYPOINT []
 CMD ["/run.sh"]
