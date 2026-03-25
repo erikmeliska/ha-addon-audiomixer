@@ -146,10 +146,16 @@ class DominantMode(MixMode):
 
 
 class DuganMode(MixMode):
-    """Dugan automixing: weight_i = rms_i^n / Σ(rms_j^n)"""
+    """Dugan automixing: weight_i = rms_i^n / Σ(rms_j^n)
+
+    GATE_RATIO: mics with weight < max_weight * GATE_RATIO get suppressed to 0.
+    This prevents secondary mics from contributing phase-shifted audio.
+    After gating, remaining weights are renormalized to sum to 1.
+    """
     name = "dugan"
     label = "Dugan"
     EXPONENT = 6
+    GATE_RATIO = 0.0  # 0 = no gate (classic Dugan)
 
     def compute_weights(self, mics):
         alive = {idx: m for idx, m in mics.items() if not m.is_dead}
@@ -168,7 +174,21 @@ class DuganMode(MixMode):
             w = 1.0 / len(alive)
             return {idx: (w if idx in alive else 0.0) for idx in mics}
 
-        return {idx: (energies.get(idx, 0.0) / total if idx in alive else 0.0) for idx in mics}
+        weights = {idx: (energies.get(idx, 0.0) / total if idx in alive else 0.0) for idx in mics}
+
+        # Apply gate: suppress mics below GATE_RATIO of max weight
+        if self.GATE_RATIO > 0:
+            max_w = max(weights.values())
+            threshold = max_w * self.GATE_RATIO
+            for idx in weights:
+                if weights[idx] < threshold:
+                    weights[idx] = 0.0
+            # Renormalize
+            total_w = sum(weights.values())
+            if total_w > 0:
+                weights = {idx: w / total_w for idx, w in weights.items()}
+
+        return weights
 
     def update_ui_state(self, mics, weights):
         super().update_ui_state(mics, weights)
@@ -178,13 +198,25 @@ class DuganMode(MixMode):
         for idx, mic in mics.items():
             w = weights.get(idx, 0)
             mic.is_dominant = (w == max_w and w > 0.3) and not mic.is_dead
-            mic.is_muted = (w < 0.1) and not mic.is_dead and not mic.below_gate
+            mic.is_muted = (w < 0.05) and not mic.is_dead and not mic.below_gate
 
 
-class DuganSharpMode(DuganMode):
-    name = "dugan_sharp"
-    label = "Dugan Sharp"
-    EXPONENT = 12
+class DuganGatedMode(DuganMode):
+    """Dugan with aggressive gate — mics below 50% of max weight are silenced.
+    Best for round table setups where phase between mics is problematic."""
+    name = "dugan_gated"
+    label = "Dugan Gated"
+    EXPONENT = 6
+    GATE_RATIO = 0.5  # mics below 50% of max get muted
+
+
+class DuganStrictMode(DuganMode):
+    """Dugan with very strict gate — essentially single-mic but with
+    smooth Dugan transitions instead of hard switching."""
+    name = "dugan_strict"
+    label = "Dugan Strict"
+    EXPONENT = 8
+    GATE_RATIO = 0.7  # only the clearly dominant mic passes
 
 
 class DuganAlignedMode(DuganMode):
@@ -295,7 +327,8 @@ MIXING_MODES: dict[str, type[MixMode]] = {
     "mix_all": MixAllMode,
     "dominant": DominantMode,
     "dugan": DuganMode,
-    "dugan_sharp": DuganSharpMode,
+    "dugan_gated": DuganGatedMode,
+    "dugan_strict": DuganStrictMode,
     "dugan_aligned": DuganAlignedMode,
 }
 
@@ -322,7 +355,7 @@ class AudioMixer:
         self._modes: dict[str, MixMode] = {
             name: cls() for name, cls in MIXING_MODES.items()
         }
-        self._current_mode_name = "dugan_aligned"
+        self._current_mode_name = "dugan_gated"
         self._mode: MixMode = self._modes[self._current_mode_name]
 
         self._record_buffers: dict[int, list] = {}  # weighted audio
