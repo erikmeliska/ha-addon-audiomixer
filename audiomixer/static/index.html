@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" class="dark">
+<html lang="en">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -7,21 +7,20 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
-            darkMode: 'class',
             theme: {
                 extend: {
                     colors: {
-                        border: 'hsl(240 3.7% 15.9%)',
-                        input: 'hsl(240 3.7% 15.9%)',
+                        border: 'hsl(240 5.9% 90%)',
+                        input: 'hsl(240 5.9% 90%)',
                         ring: 'hsl(142.1 76.2% 36.3%)',
-                        background: 'hsl(240 10% 3.9%)',
-                        foreground: 'hsl(0 0% 98%)',
+                        background: 'hsl(0 0% 100%)',
+                        foreground: 'hsl(240 10% 3.9%)',
                         primary: { DEFAULT: 'hsl(142.1 76.2% 36.3%)', foreground: 'hsl(355.7 100% 97.3%)' },
-                        secondary: { DEFAULT: 'hsl(240 3.7% 15.9%)', foreground: 'hsl(0 0% 98%)' },
-                        destructive: { DEFAULT: 'hsl(0 62.8% 30.6%)', foreground: 'hsl(0 0% 98%)' },
-                        muted: { DEFAULT: 'hsl(240 3.7% 15.9%)', foreground: 'hsl(240 5% 64.9%)' },
-                        accent: { DEFAULT: 'hsl(240 3.7% 15.9%)', foreground: 'hsl(0 0% 98%)' },
-                        card: { DEFAULT: 'hsl(240 10% 3.9%)', foreground: 'hsl(0 0% 98%)' },
+                        secondary: { DEFAULT: 'hsl(240 4.8% 95.9%)', foreground: 'hsl(240 5.9% 10%)' },
+                        destructive: { DEFAULT: 'hsl(0 84.2% 60.2%)', foreground: 'hsl(0 0% 98%)' },
+                        muted: { DEFAULT: 'hsl(240 4.8% 95.9%)', foreground: 'hsl(240 3.8% 46.1%)' },
+                        accent: { DEFAULT: 'hsl(240 4.8% 95.9%)', foreground: 'hsl(240 5.9% 10%)' },
+                        card: { DEFAULT: 'hsl(0 0% 100%)', foreground: 'hsl(240 10% 3.9%)' },
                     },
                     borderRadius: { lg: '0.5rem', md: 'calc(0.5rem - 2px)', sm: 'calc(0.5rem - 4px)' },
                 }
@@ -121,7 +120,7 @@
                             <span className="text-xs text-muted-foreground font-mono w-16 text-right">{db} dB</span>
                         </div>
                     </div>
-                    <div className="relative h-3 bg-zinc-800 rounded-full overflow-hidden">
+                    <div className="relative h-3 bg-zinc-200 rounded-full overflow-hidden">
                         <div
                             className={`absolute inset-y-0 left-0 rounded-full transition-all duration-75 ${barColor}`}
                             style={{ width: `${level}%` }}
@@ -157,7 +156,7 @@
                             </div>
                         </div>
                         <div className="flex gap-2">
-                            <a href={`/api/recordings/${rec.filename}`} download>
+                            <a href={apiUrl(`/api/recordings/${rec.filename}`)} download>
                                 <Button variant="outline" size="sm">Download</Button>
                             </a>
                             <Button variant="destructive" size="sm" onClick={() => onDelete(rec.filename)}>Delete</Button>
@@ -166,9 +165,9 @@
                     <audio
                         controls
                         preload="none"
-                        src={`/api/recordings/${rec.filename}`}
+                        src={apiUrl(`/api/recordings/${rec.filename}`)}
                         className="w-full h-8 mt-2"
-                        style={{ filter: "invert(1) hue-rotate(180deg)", opacity: 0.8 }}
+                        style={{ opacity: 0.9 }}
                     />
                 </Card>
             );
@@ -183,44 +182,103 @@
             const [connected, setConnected] = useState(false);
             const wsRef = useRef(null);
 
+            // Detect base path (HA Ingress uses /api/hassio_ingress/xxx/)
+            function getBasePath() {
+                const path = location.pathname;
+                // If accessed via ingress, strip trailing /index.html or /
+                if (path.includes("ingress")) {
+                    return path.replace(/\/+$/, "");
+                }
+                return "";
+            }
+
+            function apiUrl(endpoint) {
+                return getBasePath() + endpoint;
+            }
+
+            function wsUrl() {
+                const proto = location.protocol === "https:" ? "wss:" : "ws:";
+                return `${proto}//${location.host}${getBasePath()}/ws`;
+            }
+
             const loadRecordings = useCallback(async () => {
                 try {
-                    const res = await fetch("/api/recordings");
+                    const res = await fetch(apiUrl("/api/recordings"));
                     setRecordings(await res.json());
                 } catch (e) {}
             }, []);
 
-            useEffect(() => {
-                const proto = location.protocol === "https:" ? "wss:" : "ws:";
-                const ws = new WebSocket(`${proto}//${location.host}/ws`);
-                wsRef.current = ws;
+            const pollStatus = useCallback(async () => {
+                try {
+                    const res = await fetch(apiUrl("/api/status"));
+                    const data = await res.json();
+                    setStatus(data);
+                    setConnected(true);
+                } catch (e) {
+                    setConnected(false);
+                }
+            }, []);
 
-                ws.onopen = () => setConnected(true);
+            const connectWs = useCallback(() => {
+                const url = wsUrl();
+                console.log("WS connecting to:", url);
+                let ws;
+                try {
+                    ws = new WebSocket(url);
+                } catch (e) {
+                    console.log("WS failed, falling back to polling");
+                    return false;
+                }
+                wsRef.current = ws;
+                let wsWorked = false;
+
+                ws.onopen = () => { setConnected(true); wsWorked = true; };
                 ws.onclose = () => {
                     setConnected(false);
-                    setTimeout(() => location.reload(), 3000);
+                    if (wsWorked) {
+                        setTimeout(connectWs, 3000);
+                    }
+                    // If WS never worked, polling will take over
                 };
+                ws.onerror = () => {};
                 ws.onmessage = (e) => {
                     try { setStatus(JSON.parse(e.data)); } catch {}
                 };
+                return true;
+            }, []);
 
+            useEffect(() => {
+                connectWs();
+                // Always poll as fallback (works through Ingress)
+                const statusInterval = setInterval(pollStatus, 200);
                 loadRecordings();
                 const interval = setInterval(loadRecordings, 5000);
 
                 return () => {
-                    ws.close();
+                    if (wsRef.current) wsRef.current.close();
                     clearInterval(interval);
+                    clearInterval(statusInterval);
                 };
-            }, [loadRecordings]);
+            }, [loadRecordings, connectWs, pollStatus]);
 
-            const send = (action) => {
+            const send = async (action) => {
                 if (wsRef.current?.readyState === WebSocket.OPEN) {
                     wsRef.current.send(JSON.stringify({ action }));
+                } else {
+                    // Fallback: use REST API
+                    const endpoints = {
+                        record_start: "/api/record/start",
+                        record_stop: "/api/record/stop",
+                        toggle_dominant: "/api/dominant/toggle",
+                    };
+                    if (endpoints[action]) {
+                        await fetch(apiUrl(endpoints[action]), { method: "POST" });
+                    }
                 }
             };
 
             const deleteRecording = async (filename) => {
-                await fetch(`/api/recordings/${filename}`, { method: "DELETE" });
+                await fetch(apiUrl(`/api/recordings/${filename}`), { method: "DELETE" });
                 loadRecordings();
             };
 
