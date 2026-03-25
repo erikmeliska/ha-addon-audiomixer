@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 Shared AudioMixer with pluggable mixing modes.
-Modes: mix_all, dominant, dugan (more can be added).
+Modes: mix_all, dominant, dugan, dugan_sharp, dugan_aligned (phase-aligned).
 """
 
+import collections
 import glob
 import os
 import threading
@@ -23,6 +24,11 @@ NOISE_GATE_RMS = 0.005
 DEAD_MIC_BLOCKS = 30
 AUTO_SELECT_KEYWORD = "fifine"
 
+# Phase alignment
+MAX_DELAY_SAMPLES = 48  # ~3ms at 16kHz, covers ~1m distance
+CORRELATION_WINDOW = 2048  # samples used for cross-correlation
+DELAY_UPDATE_INTERVAL = 0.1  # seconds between delay re-estimation
+
 
 @dataclass
 class MicState:
@@ -36,29 +42,26 @@ class MicState:
     is_dead: bool = False
     below_gate: bool = False
     gain: float = 0.0
-    weight: float = 0.0  # mixing weight (0-1), shown in UI
+    weight: float = 0.0
+    delay: int = 0  # estimated delay in samples vs reference mic
     _zero_blocks: int = 0
 
 
 # ── Mixing Modes ─────────────────────────────────────────────────
 
 class MixMode(ABC):
-    """Base class for mixing modes."""
     name: str = "base"
     label: str = "Base"
+    needs_raw_buffers: bool = False  # if True, mixer stores raw audio for post-processing
 
     def reset(self):
-        """Called when mode is activated or mics change."""
         pass
 
     @abstractmethod
     def compute_weights(self, mics: dict[int, MicState]) -> dict[int, float]:
-        """Return target weight (0-1) for each mic index.
-        Called from audio callback — must be fast."""
         ...
 
     def update_ui_state(self, mics: dict[int, MicState], weights: dict[int, float]):
-        """Update mic UI flags based on computed weights."""
         for idx, mic in mics.items():
             w = weights.get(idx, 0)
             mic.weight = w
@@ -66,7 +69,6 @@ class MixMode(ABC):
 
 
 class MixAllMode(MixMode):
-    """Simple equal mix — all mics at equal weight."""
     name = "mix_all"
     label = "Mix All"
 
@@ -85,10 +87,8 @@ class MixAllMode(MixMode):
 
 
 class DominantMode(MixMode):
-    """Single dominant mic with hysteresis and hold time."""
     name = "dominant"
     label = "Dominant"
-
     RELEASE_RMS = 0.008
     MIN_HOLD = 0.5
     SWITCH_RATIO = 1.5
@@ -118,7 +118,6 @@ class DominantMode(MixMode):
             current_rms = mics[self.dominant_idx].smoothed_rms
             loudest = max(active, key=active.get)
             loudest_rms = active[loudest]
-
             all_alive = {idx for idx, m in mics.items() if not m.is_dead}
             above_gate_ratio = len(active) / max(len(all_alive), 1)
 
@@ -127,8 +126,7 @@ class DominantMode(MixMode):
                     self.dominant_idx = loudest
                     self._hold_until = now + self.MIN_HOLD
             else:
-                dom_speaking = current_rms >= self.RELEASE_RMS
-                if dom_speaking:
+                if current_rms >= self.RELEASE_RMS:
                     self._hold_until = now + self.MIN_HOLD
                 elif now >= self._hold_until:
                     if loudest != self.dominant_idx and loudest_rms > current_rms * self.SWITCH_RATIO:
@@ -137,15 +135,7 @@ class DominantMode(MixMode):
                     elif current_rms < NOISE_GATE_RMS:
                         self.dominant_idx = loudest if active else None
 
-        weights = {}
-        for idx in mics:
-            if self.dominant_idx is None:
-                weights[idx] = 0.0
-            elif idx == self.dominant_idx:
-                weights[idx] = 1.0
-            else:
-                weights[idx] = 0.0
-        return weights
+        return {idx: (1.0 if idx == self.dominant_idx else 0.0) for idx in mics}
 
     def update_ui_state(self, mics, weights):
         super().update_ui_state(mics, weights)
@@ -156,56 +146,35 @@ class DominantMode(MixMode):
 
 
 class DuganMode(MixMode):
-    """Dugan automixing — gain proportional to energy.
-
-    weight_i = rms_i^n / Σ(rms_j^n)
-
-    Higher exponent = sharper focus on loudest mic.
-    n=2: gentle (original Dugan), n=6: sharp (reduces phase between mics).
-    """
+    """Dugan automixing: weight_i = rms_i^n / Σ(rms_j^n)"""
     name = "dugan"
-    label = "Dugan Automix"
-
-    # Exponent controls focus sharpness:
-    # 2 = classic Dugan (gentle), 4 = moderate, 6 = sharp, 8 = very sharp
+    label = "Dugan"
     EXPONENT = 6
 
     def compute_weights(self, mics):
-        weights = {}
         alive = {idx: m for idx, m in mics.items() if not m.is_dead}
-
         if not alive:
             return {idx: 0.0 for idx in mics}
 
         energies = {}
         for idx, m in alive.items():
-            rms = m.smoothed_rms
-            if rms < NOISE_GATE_RMS:
+            if m.smoothed_rms < NOISE_GATE_RMS:
                 energies[idx] = 0.0
             else:
-                energies[idx] = rms ** self.EXPONENT
+                energies[idx] = m.smoothed_rms ** self.EXPONENT
 
-        total_energy = sum(energies.values())
-
-        if total_energy < 1e-30:
+        total = sum(energies.values())
+        if total < 1e-30:
             w = 1.0 / len(alive)
-            for idx in mics:
-                weights[idx] = w if idx in alive else 0.0
-        else:
-            for idx in mics:
-                if idx in alive:
-                    weights[idx] = energies[idx] / total_energy
-                else:
-                    weights[idx] = 0.0
+            return {idx: (w if idx in alive else 0.0) for idx in mics}
 
-        return weights
+        return {idx: (energies.get(idx, 0.0) / total if idx in alive else 0.0) for idx in mics}
 
     def update_ui_state(self, mics, weights):
         super().update_ui_state(mics, weights)
-        # In Dugan, dominant = highest weight, muted = weight < 10%
         if not weights:
             return
-        max_w = max(weights.values()) if weights else 0
+        max_w = max(weights.values())
         for idx, mic in mics.items():
             w = weights.get(idx, 0)
             mic.is_dominant = (w == max_w and w > 0.3) and not mic.is_dead
@@ -213,11 +182,111 @@ class DuganMode(MixMode):
 
 
 class DuganSharpMode(DuganMode):
-    """Dugan with very high exponent — nearly single-mic selection
-    but with smooth transitions instead of hard switching."""
     name = "dugan_sharp"
     label = "Dugan Sharp"
     EXPONENT = 12
+
+
+class DuganAlignedMode(DuganMode):
+    """Dugan + phase alignment via cross-correlation.
+
+    Before mixing, estimates delay between each mic and a reference mic,
+    then shifts signals to align them. Eliminates comb filtering
+    when multiple mics pick up the same source.
+    """
+    name = "dugan_aligned"
+    label = "Dugan + Phase Align"
+    EXPONENT = 6
+    needs_raw_buffers = True
+
+    def __init__(self):
+        super().__init__()
+        # Ring buffers for cross-correlation (per mic)
+        self._ring_buffers: dict[int, collections.deque] = {}
+        self._delays: dict[int, int] = {}  # samples delay per mic
+        self._ref_idx: int | None = None
+        self._last_delay_update: float = 0
+
+    def reset(self):
+        self._ring_buffers.clear()
+        self._delays.clear()
+        self._ref_idx = None
+        self._last_delay_update = 0
+
+    def feed_audio(self, dev_idx: int, samples: np.ndarray):
+        """Feed raw audio into ring buffer for correlation."""
+        if dev_idx not in self._ring_buffers:
+            self._ring_buffers[dev_idx] = collections.deque(maxlen=CORRELATION_WINDOW)
+        self._ring_buffers[dev_idx].extend(samples.tolist())
+
+    def update_delays(self, mics: dict[int, MicState]):
+        """Re-estimate delays between mics using cross-correlation."""
+        now = time.monotonic()
+        if now - self._last_delay_update < DELAY_UPDATE_INTERVAL:
+            return
+        self._last_delay_update = now
+
+        # Pick reference mic: loudest alive mic
+        alive = {idx: m for idx, m in mics.items()
+                 if not m.is_dead and m.smoothed_rms >= NOISE_GATE_RMS}
+        if not alive:
+            return
+
+        self._ref_idx = max(alive, key=lambda idx: alive[idx].smoothed_rms)
+
+        ref_buf = self._ring_buffers.get(self._ref_idx)
+        if ref_buf is None or len(ref_buf) < CORRELATION_WINDOW // 2:
+            return
+
+        ref = np.array(ref_buf, dtype=np.float32)
+
+        for idx in mics:
+            if idx == self._ref_idx:
+                self._delays[idx] = 0
+                continue
+
+            buf = self._ring_buffers.get(idx)
+            if buf is None or len(buf) < CORRELATION_WINDOW // 2:
+                self._delays[idx] = 0
+                continue
+
+            other = np.array(buf, dtype=np.float32)
+
+            # Use the shorter of the two
+            n = min(len(ref), len(other))
+            r = ref[-n:]
+            o = other[-n:]
+
+            # Cross-correlation via FFT (fast)
+            # Only check delays up to MAX_DELAY_SAMPLES
+            corr = np.correlate(
+                r[MAX_DELAY_SAMPLES:-MAX_DELAY_SAMPLES] if n > 2 * MAX_DELAY_SAMPLES else r,
+                o[:n],
+                mode='full' if n <= 2 * MAX_DELAY_SAMPLES else 'same'
+            )
+
+            # Simpler: direct small-window correlation
+            if n > 2 * MAX_DELAY_SAMPLES:
+                best_delay = 0
+                best_corr = 0
+                for d in range(-MAX_DELAY_SAMPLES, MAX_DELAY_SAMPLES + 1):
+                    if d >= 0:
+                        c = np.sum(r[d:] * o[:n - d])
+                    else:
+                        c = np.sum(r[:n + d] * o[-d:])
+                    if c > best_corr:
+                        best_corr = c
+                        best_delay = d
+                self._delays[idx] = best_delay
+            else:
+                self._delays[idx] = 0
+
+        # Update mic state
+        for idx, mic in mics.items():
+            mic.delay = self._delays.get(idx, 0)
+
+    def get_delays(self) -> dict[int, int]:
+        return dict(self._delays)
 
 
 # ── Mode registry ────────────────────────────────────────────────
@@ -227,9 +296,10 @@ MIXING_MODES: dict[str, type[MixMode]] = {
     "dominant": DominantMode,
     "dugan": DuganMode,
     "dugan_sharp": DuganSharpMode,
+    "dugan_aligned": DuganAlignedMode,
 }
 
-GAIN_SMOOTHING = 0.15  # how fast gain transitions (per block)
+GAIN_SMOOTHING = 0.15
 
 
 # ── AudioMixer ───────────────────────────────────────────────────
@@ -249,14 +319,14 @@ class AudioMixer:
         self.is_live = False
         self.is_recording = False
 
-        # Mixing mode
         self._modes: dict[str, MixMode] = {
             name: cls() for name, cls in MIXING_MODES.items()
         }
-        self._current_mode_name = "dugan"  # default
+        self._current_mode_name = "dugan_aligned"
         self._mode: MixMode = self._modes[self._current_mode_name]
 
-        self._record_buffers: dict[int, list] = {}
+        self._record_buffers: dict[int, list] = {}  # weighted audio
+        self._raw_buffers: dict[int, list] = {}  # raw audio (for phase-aligned modes)
         self._record_start_time: float = 0
 
         self._lock = threading.Lock()
@@ -276,12 +346,12 @@ class AudioMixer:
         self._current_mode_name = mode_name
         self._mode = self._modes[mode_name]
         self._mode.reset()
-        # Reset mic UI state
         for mic in self.mics.values():
             mic.is_dominant = False
             mic.is_muted = False
             mic.gain = 0.0
             mic.weight = 0.0
+            mic.delay = 0
         self._notify("mode_changed", {"mode": mode_name})
 
     def add_listener(self, callback):
@@ -318,6 +388,7 @@ class AudioMixer:
         for dev in selected:
             self.mics[dev.index] = MicState(device=dev)
             self._record_buffers[dev.index] = []
+            self._raw_buffers[dev.index] = []
 
         self._mode.reset()
         self.is_live = True
@@ -349,6 +420,7 @@ class AudioMixer:
         self._record_start_time = time.time()
         for idx in self._record_buffers:
             self._record_buffers[idx] = []
+            self._raw_buffers[idx] = []
         self._notify("recording_started")
 
     def stop_recording(self) -> str | None:
@@ -356,7 +428,12 @@ class AudioMixer:
             return None
         self.is_recording = False
         elapsed = time.time() - self._record_start_time
-        path = self._save_recording(elapsed)
+
+        if self._mode.needs_raw_buffers:
+            path = self._save_recording_aligned(elapsed)
+        else:
+            path = self._save_recording(elapsed)
+
         self._notify("recording_stopped", {"path": path, "duration": elapsed})
         return path
 
@@ -374,6 +451,7 @@ class AudioMixer:
                 "is_dead": mic.is_dead,
                 "below_gate": mic.below_gate,
                 "weight": round(mic.weight, 3),
+                "delay": mic.delay,
             })
         return {
             "is_live": self.is_live,
@@ -425,33 +503,45 @@ class AudioMixer:
 
             mic.level = scaled
 
-            # Dead mic detection
             if rms < 1e-10:
                 mic._zero_blocks += 1
             else:
                 mic._zero_blocks = 0
             mic.is_dead = mic._zero_blocks >= DEAD_MIC_BLOCKS
 
-            # Smooth RMS (EMA: fast attack, slow release)
             alpha = 0.3 if rms > mic.smoothed_rms else 0.05
             mic.smoothed_rms = alpha * rms + (1 - alpha) * mic.smoothed_rms
 
             if scaled > mic.peak:
                 mic.peak = scaled
 
-            # Compute mixing weights via current mode
+            # Feed audio to phase-aligned mode's ring buffer
+            if isinstance(self._mode, DuganAlignedMode):
+                self._mode.feed_audio(dev_idx, mono)
+                self._mode.update_delays(self.mics)
+
+            # Compute mixing weights
             weights = self._mode.compute_weights(self.mics)
             self._mode.update_ui_state(self.mics, weights)
 
-            # Recording: apply smoothed gain
+            # Recording
             if self.is_recording:
-                target = weights.get(dev_idx, 0.0)
-                mic.gain += GAIN_SMOOTHING * (target - mic.gain)
-                self._record_buffers[dev_idx].append(mono * mic.gain)
+                if self._mode.needs_raw_buffers:
+                    # Store raw audio — alignment happens at save time
+                    self._raw_buffers[dev_idx].append(mono.copy())
+                    # Also store weighted for fallback
+                    target = weights.get(dev_idx, 0.0)
+                    mic.gain += GAIN_SMOOTHING * (target - mic.gain)
+                    self._record_buffers[dev_idx].append(mono * mic.gain)
+                else:
+                    target = weights.get(dev_idx, 0.0)
+                    mic.gain += GAIN_SMOOTHING * (target - mic.gain)
+                    self._record_buffers[dev_idx].append(mono * mic.gain)
 
         return callback
 
     def _save_recording(self, elapsed: float) -> str | None:
+        """Save recording with pre-applied weights (non-aligned modes)."""
         all_arrays = {}
         max_len = 0
         for idx, chunks in self._record_buffers.items():
@@ -469,7 +559,6 @@ class AudioMixer:
             padded[:len(arr)] = arr
             mixed += padded
 
-        # Normalize (weights already sum to ~1, but normalize for safety)
         peak = np.max(np.abs(mixed))
         if peak > 0:
             mixed = mixed / peak * 0.95
@@ -478,6 +567,119 @@ class AudioMixer:
         output_path = os.path.join(self.recordings_dir, f"mixed_{ts}.wav")
         sf.write(output_path, mixed, SAMPLE_RATE)
         return output_path
+
+    def _save_recording_aligned(self, elapsed: float) -> str | None:
+        """Save recording with block-by-block phase alignment + Dugan weights."""
+        # Get raw audio per mic
+        raw = {}
+        max_len = 0
+        for idx, chunks in self._raw_buffers.items():
+            if chunks:
+                arr = np.concatenate(chunks)
+                raw[idx] = arr
+                max_len = max(max_len, len(arr))
+
+        if not raw or max_len == 0:
+            return None
+
+        # Pad all to same length
+        for idx in raw:
+            if len(raw[idx]) < max_len:
+                raw[idx] = np.pad(raw[idx], (0, max_len - len(raw[idx])))
+
+        # Process in blocks: align + weight
+        block_size = BLOCKSIZE
+        mixed = np.zeros(max_len, dtype=np.float32)
+        mic_indices = list(raw.keys())
+
+        for start in range(0, max_len - block_size, block_size):
+            end = start + block_size
+            blocks = {idx: raw[idx][start:end] for idx in mic_indices}
+
+            # Find reference (highest RMS in this block)
+            rms_vals = {idx: np.sqrt(np.mean(b ** 2)) for idx, b in blocks.items()}
+            ref_idx = max(rms_vals, key=rms_vals.get)
+            ref_block = blocks[ref_idx]
+
+            # Compute Dugan weights for this block
+            energies = {}
+            for idx, r in rms_vals.items():
+                if r < NOISE_GATE_RMS:
+                    energies[idx] = 0.0
+                else:
+                    energies[idx] = r ** 6  # Dugan exponent
+            total_e = sum(energies.values())
+
+            if total_e < 1e-30:
+                weights = {idx: 1.0 / len(mic_indices) for idx in mic_indices}
+            else:
+                weights = {idx: energies[idx] / total_e for idx in mic_indices}
+
+            # Align each mic to reference and mix
+            block_mixed = np.zeros(block_size, dtype=np.float32)
+            for idx in mic_indices:
+                b = blocks[idx]
+                w = weights[idx]
+
+                if idx == ref_idx or w < 0.01:
+                    # Reference mic or negligible weight — no alignment needed
+                    block_mixed += b * w
+                    continue
+
+                # Cross-correlate to find delay
+                delay = self._find_delay(ref_block, b)
+
+                # Apply delay shift
+                if delay > 0:
+                    aligned = np.zeros(block_size, dtype=np.float32)
+                    aligned[delay:] = b[:block_size - delay]
+                elif delay < 0:
+                    aligned = np.zeros(block_size, dtype=np.float32)
+                    aligned[:block_size + delay] = b[-delay:]
+                else:
+                    aligned = b
+
+                block_mixed += aligned * w
+
+            mixed[start:end] = block_mixed
+
+        # Handle remaining samples
+        remainder = max_len % block_size
+        if remainder > 0:
+            start = max_len - remainder
+            for idx in mic_indices:
+                w = 1.0 / len(mic_indices)
+                mixed[start:] += raw[idx][start:] * w
+
+        peak = np.max(np.abs(mixed))
+        if peak > 0:
+            mixed = mixed / peak * 0.95
+
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(self.recordings_dir, f"aligned_{ts}.wav")
+        sf.write(output_path, mixed, SAMPLE_RATE)
+        return output_path
+
+    @staticmethod
+    def _find_delay(ref: np.ndarray, other: np.ndarray) -> int:
+        """Find delay of 'other' relative to 'ref' using cross-correlation.
+        Returns positive value if other is delayed (needs shift forward)."""
+        n = len(ref)
+        max_d = min(MAX_DELAY_SAMPLES, n // 4)
+
+        best_delay = 0
+        best_corr = -1e30
+
+        for d in range(-max_d, max_d + 1):
+            if d >= 0:
+                c = np.dot(ref[d:], other[:n - d])
+            else:
+                c = np.dot(ref[:n + d], other[-d:])
+            if c > best_corr:
+                best_corr = c
+                best_delay = d
+
+        return best_delay
 
     def decay_peaks(self):
         for mic in self.mics.values():

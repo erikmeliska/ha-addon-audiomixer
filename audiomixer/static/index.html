@@ -118,6 +118,9 @@
                         </div>
                         <div className="flex items-center gap-2">
                             {statusBadge}
+                            {mode === "dugan_aligned" && mic.delay !== 0 && (
+                                <span className="text-xs font-mono text-violet-500">{mic.delay > 0 ? "+" : ""}{mic.delay}s</span>
+                            )}
                             {mode !== "mix_all" && (
                                 <span className={`text-xs font-mono w-10 text-right ${weightPct > 50 ? "text-emerald-600 font-semibold" : "text-muted-foreground"}`}>
                                     {weightPct}%
