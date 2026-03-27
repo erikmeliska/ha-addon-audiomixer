@@ -363,6 +363,26 @@
                         )}
                     </div>
 
+                    {/* RPi Address for meeting app */}
+                    <Card className="p-3 mb-4 flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                            <span className="text-xs font-medium text-muted-foreground">RPi Address:</span>
+                            <code className="text-sm font-mono bg-zinc-100 px-2 py-0.5 rounded select-all">
+                                {location.protocol + "//" + location.hostname + ":8099"}
+                            </code>
+                        </div>
+                        <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => {
+                                const addr = location.protocol + "//" + location.hostname + ":8099";
+                                navigator.clipboard.writeText(addr);
+                            }}
+                        >
+                            Copy
+                        </Button>
+                    </Card>
+
                     {/* Tabs */}
                     <div className="flex gap-1 mb-6 p-1 bg-secondary rounded-lg">
                         <button
