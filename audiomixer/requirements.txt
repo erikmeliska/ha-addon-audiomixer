@@ -1,5 +1,6 @@
 sounddevice>=0.5
+numpy>=2.0
 soundfile>=0.13
 textual>=8.0
 aiohttp>=3.9
-numpy>=2.0
+websockets>=12.0

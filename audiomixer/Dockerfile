@@ -29,7 +29,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
 
-COPY audio_backend.py mixer.py web_app.py tui.py mix_mics.py ./
+COPY audio_backend.py mixer.py web_app.py tui.py mix_mics.py deepgram_streamer.py remote_session.py ./
 COPY static/ ./static/
 
 COPY run.sh /

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Shared AudioMixer with pluggable mixing modes.
+Shared AudioMixer with pluggable mixing modes and auto-record.
 Modes: mix_all, dominant, dugan, dugan_gated, dugan_strict, smart.
 """
 
@@ -26,10 +26,13 @@ DEAD_MIC_BLOCKS = 30
 AUTO_SELECT_KEYWORD = "fifine"
 
 # Smart mode correlation
-CORR_WINDOW = 2048  # samples for cross-correlation
-CORR_UPDATE_INTERVAL = 0.15  # seconds between correlation updates
-CORR_ECHO_THRESHOLD = 0.6  # above this = same source (echo)
-CORR_INDEPENDENT_THRESHOLD = 0.3  # below this = independent speakers
+CORR_WINDOW = 2048
+CORR_UPDATE_INTERVAL = 0.15
+CORR_ECHO_THRESHOLD = 0.6
+CORR_INDEPENDENT_THRESHOLD = 0.3
+
+# Auto-record
+AUTO_RECORD_SILENCE_TIMEOUT = 300  # 5 minutes of silence before stopping
 
 
 @dataclass
@@ -44,7 +47,7 @@ class MicState:
     below_gate: bool = False
     gain: float = 0.0
     weight: float = 0.0
-    correlation: float = 0.0  # correlation with dominant mic (0-1)
+    correlation: float = 0.0
     _zero_blocks: int = 0
 
 
@@ -58,7 +61,6 @@ class MixMode(ABC):
         pass
 
     def feed_audio(self, dev_idx: int, samples: np.ndarray):
-        """Override to receive raw audio per block."""
         pass
 
     @abstractmethod
@@ -107,7 +109,6 @@ class DominantMode(MixMode):
             idx: m.smoothed_rms for idx, m in mics.items()
             if m.smoothed_rms >= NOISE_GATE_RMS and not m.is_dead
         }
-
         if not active:
             if now >= self._hold_until:
                 self.dominant_idx = None
@@ -125,7 +126,6 @@ class DominantMode(MixMode):
                     self._hold_until = now + 0.5
                 elif current_rms < NOISE_GATE_RMS:
                     self.dominant_idx = loudest if active else None
-
         return {idx: (1.0 if idx == self.dominant_idx else 0.0) for idx in mics}
 
     def update_ui_state(self, mics, weights):
@@ -147,21 +147,17 @@ class DuganMode(MixMode):
         alive = {idx: m for idx, m in mics.items() if not m.is_dead}
         if not alive:
             return {idx: 0.0 for idx in mics}
-
         energies = {}
         for idx, m in alive.items():
             if m.smoothed_rms < NOISE_GATE_RMS:
                 energies[idx] = 0.0
             else:
                 energies[idx] = m.smoothed_rms ** self.EXPONENT
-
         total = sum(energies.values())
         if total < 1e-30:
             w = 1.0 / len(alive)
             return {idx: (w if idx in alive else 0.0) for idx in mics}
-
         weights = {idx: (energies.get(idx, 0.0) / total if idx in alive else 0.0) for idx in mics}
-
         if self.GATE_RATIO > 0:
             max_w = max(weights.values())
             threshold = max_w * self.GATE_RATIO
@@ -171,7 +167,6 @@ class DuganMode(MixMode):
             total_w = sum(weights.values())
             if total_w > 0:
                 weights = {idx: w / total_w for idx, w in weights.items()}
-
         return weights
 
     def update_ui_state(self, mics, weights):
@@ -200,14 +195,7 @@ class DuganStrictMode(DuganMode):
 
 
 class SmartMode(MixMode):
-    """Smart mode: Dugan + correlation-based echo detection.
-
-    For each pair of active mics, computes cross-correlation:
-    - High correlation (>0.6) = same source heard by both → gate the weaker one
-    - Low correlation (<0.3) = different speakers → allow both with Dugan weights
-
-    This lets multiple simultaneous speakers through while suppressing echo.
-    """
+    """Dugan + correlation-based echo detection."""
     name = "smart"
     label = "Smart"
     EXPONENT = 6
@@ -222,112 +210,77 @@ class SmartMode(MixMode):
         self._correlations.clear()
         self._last_corr_update = 0
 
-    def feed_audio(self, dev_idx: int, samples: np.ndarray):
+    def feed_audio(self, dev_idx, samples):
         if dev_idx not in self._ring_buffers:
             self._ring_buffers[dev_idx] = collections.deque(maxlen=CORR_WINDOW)
         self._ring_buffers[dev_idx].extend(samples.tolist())
 
-    def _update_correlations(self, mics: dict[int, MicState]):
+    def _update_correlations(self, mics):
         now = time.monotonic()
         if now - self._last_corr_update < CORR_UPDATE_INTERVAL:
             return
         self._last_corr_update = now
-
-        active_ids = [
-            idx for idx, m in mics.items()
-            if m.smoothed_rms >= NOISE_GATE_RMS and not m.is_dead
-        ]
-
+        active_ids = [idx for idx, m in mics.items() if m.smoothed_rms >= NOISE_GATE_RMS and not m.is_dead]
         for i, idx_a in enumerate(active_ids):
             for idx_b in active_ids[i + 1:]:
                 buf_a = self._ring_buffers.get(idx_a)
                 buf_b = self._ring_buffers.get(idx_b)
                 if not buf_a or not buf_b:
                     continue
-
                 n = min(len(buf_a), len(buf_b), CORR_WINDOW)
                 if n < BLOCKSIZE:
                     continue
-
                 a = np.array(list(buf_a)[-n:], dtype=np.float32)
                 b = np.array(list(buf_b)[-n:], dtype=np.float32)
-
-                # Normalized cross-correlation (Pearson)
-                a_mean = a - np.mean(a)
-                b_mean = b - np.mean(b)
-                norm_a = np.sqrt(np.sum(a_mean ** 2))
-                norm_b = np.sqrt(np.sum(b_mean ** 2))
-
-                if norm_a < 1e-10 or norm_b < 1e-10:
+                a_m = a - np.mean(a)
+                b_m = b - np.mean(b)
+                na = np.sqrt(np.sum(a_m ** 2))
+                nb = np.sqrt(np.sum(b_m ** 2))
+                if na < 1e-10 or nb < 1e-10:
                     corr = 0.0
                 else:
-                    corr = float(np.sum(a_mean * b_mean) / (norm_a * norm_b))
-                    corr = max(0.0, corr)  # only positive correlation matters
-
+                    corr = max(0.0, float(np.sum(a_m * b_m) / (na * nb)))
                 self._correlations[(idx_a, idx_b)] = corr
                 self._correlations[(idx_b, idx_a)] = corr
 
-    def _get_correlation(self, idx_a: int, idx_b: int) -> float:
-        return self._correlations.get((idx_a, idx_b), 0.0)
-
     def compute_weights(self, mics):
         self._update_correlations(mics)
-
         alive = {idx: m for idx, m in mics.items() if not m.is_dead}
         if not alive:
             return {idx: 0.0 for idx in mics}
-
-        # Step 1: Compute base Dugan weights
         energies = {}
         for idx, m in alive.items():
             if m.smoothed_rms < NOISE_GATE_RMS:
                 energies[idx] = 0.0
             else:
                 energies[idx] = m.smoothed_rms ** self.EXPONENT
-
         total = sum(energies.values())
         if total < 1e-30:
             w = 1.0 / len(alive)
             return {idx: (w if idx in alive else 0.0) for idx in mics}
-
         weights = {idx: energies.get(idx, 0.0) / total for idx in alive}
-
-        # Step 2: For each mic pair, check correlation
-        # If highly correlated (echo), suppress the weaker one
-        # If uncorrelated (different speakers), keep both
         active_ids = [idx for idx in alive if weights.get(idx, 0) > 0.01]
         suppressed = set()
-
         for i, idx_a in enumerate(active_ids):
             for idx_b in active_ids[i + 1:]:
-                corr = self._get_correlation(idx_a, idx_b)
-
+                corr = self._correlations.get((idx_a, idx_b), 0.0)
                 if corr > CORR_ECHO_THRESHOLD:
-                    # Same source — suppress the weaker mic
                     if weights[idx_a] >= weights[idx_b]:
                         suppressed.add(idx_b)
                     else:
                         suppressed.add(idx_a)
-                # If corr < CORR_INDEPENDENT_THRESHOLD → independent, keep both
-                # If between thresholds → partial suppression via weight reduction
                 elif corr > CORR_INDEPENDENT_THRESHOLD:
-                    # Transition zone: reduce weaker mic proportionally
                     blend = (corr - CORR_INDEPENDENT_THRESHOLD) / (CORR_ECHO_THRESHOLD - CORR_INDEPENDENT_THRESHOLD)
                     weaker = idx_b if weights[idx_a] >= weights[idx_b] else idx_a
-                    weights[weaker] *= (1.0 - blend * 0.9)  # reduce up to 90%
-
-        # Apply suppression
+                    weights[weaker] *= (1.0 - blend * 0.9)
         for idx in suppressed:
             weights[idx] = 0.0
-
-        # Renormalize
         final = {idx: 0.0 for idx in mics}
         for idx in alive:
             final[idx] = weights.get(idx, 0.0)
         total_w = sum(final.values())
         if total_w > 0:
             final = {idx: w / total_w for idx, w in final.items()}
-
         return final
 
     def update_ui_state(self, mics, weights):
@@ -339,15 +292,11 @@ class SmartMode(MixMode):
             w = weights.get(idx, 0)
             mic.is_dominant = (w == max_w and w > 0.3) and not mic.is_dead
             mic.is_muted = (w < 0.05) and not mic.is_dead and not mic.below_gate
-            # Show correlation with dominant mic
             if mic.is_dominant:
                 mic.correlation = 1.0
             else:
-                dominant_idx = next((i for i, m in mics.items() if m.is_dominant), None)
-                if dominant_idx is not None:
-                    mic.correlation = self._get_correlation(idx, dominant_idx)
-                else:
-                    mic.correlation = 0.0
+                dom = next((i for i, m in mics.items() if m.is_dominant), None)
+                mic.correlation = self._correlations.get((idx, dom), 0.0) if dom else 0.0
 
 
 # ── Mode registry ────────────────────────────────────────────────
@@ -367,7 +316,7 @@ GAIN_SMOOTHING = 0.15
 # ── AudioMixer ───────────────────────────────────────────────────
 
 class AudioMixer:
-    """Core audio mixer with pluggable mixing modes."""
+    """Core audio mixer with pluggable mixing modes and auto-record."""
 
     def __init__(self, recordings_dir: str = "."):
         self.backend = AudioBackend()
@@ -381,17 +330,25 @@ class AudioMixer:
         self.is_live = False
         self.is_recording = False
 
+        # Mixing mode
         self._modes: dict[str, MixMode] = {
             name: cls() for name, cls in MIXING_MODES.items()
         }
         self._current_mode_name = "smart"
         self._mode: MixMode = self._modes[self._current_mode_name]
 
+        # Auto-record
+        self.auto_record_enabled = False
+        self._auto_record_active = False
+        self._last_signal_time: float = 0
+        self._auto_record_silence_timeout = AUTO_RECORD_SILENCE_TIMEOUT
+
         self._record_buffers: dict[int, list] = {}
         self._record_start_time: float = 0
 
         self._lock = threading.Lock()
         self._listeners: list = []
+        self._audio_sink: callable | None = None
 
     @property
     def mode_name(self) -> str:
@@ -415,8 +372,13 @@ class AudioMixer:
             mic.correlation = 0.0
         self._notify("mode_changed", {"mode": mode_name})
 
+    def set_auto_record(self, enabled: bool):
+        self.auto_record_enabled = enabled
+        if not enabled and self._auto_record_active:
+            self._auto_record_stop()
+        self._notify("auto_record_changed", {"enabled": enabled})
+
     def set_mic_volume(self, source_name: str, volume_pct: int):
-        """Set PulseAudio source volume (0-100%)."""
         try:
             subprocess.run(
                 ["pactl", "set-source-volume", source_name, f"{volume_pct}%"],
@@ -445,35 +407,31 @@ class AudioMixer:
     def start(self, device_indices: list[int] | None = None):
         if self.is_live:
             self.stop()
-
         selected = []
         if device_indices is None:
             selected = self.get_auto_devices() or self.devices
         else:
             selected = [d for d in self.devices if d.index in device_indices]
-
         if not selected:
             return
-
         self.mics.clear()
         for dev in selected:
             self.mics[dev.index] = MicState(device=dev)
             self._record_buffers[dev.index] = []
-
         self._mode.reset()
         self.is_live = True
-
         for dev in selected:
             stream = self.backend.open_stream(dev, self._make_callback(dev.index))
             stream.start()
             self.streams.append(stream)
-
         self._notify("started")
 
     def stop(self):
         self.is_live = False
         if self.is_recording:
             self.stop_recording()
+        if self._auto_record_active:
+            self._auto_record_stop()
         for s in self.streams:
             try:
                 s.stop()
@@ -496,6 +454,7 @@ class AudioMixer:
         if not self.is_recording:
             return None
         self.is_recording = False
+        self._auto_record_active = False
         elapsed = time.time() - self._record_start_time
         path = self._save_recording(elapsed)
         self._notify("recording_stopped", {"path": path, "duration": elapsed})
@@ -524,6 +483,8 @@ class AudioMixer:
             "mode": self._current_mode_name,
             "mode_label": self._mode.label,
             "available_modes": self.available_modes,
+            "auto_record": self.auto_record_enabled,
+            "auto_record_active": self._auto_record_active,
             "recording_duration": (time.time() - self._record_start_time) if self.is_recording else 0,
             "mics": mics_data,
         }
@@ -553,6 +514,39 @@ class AudioMixer:
             return True
         except OSError:
             return False
+
+    # ── Auto-record ──────────────────────────────────────────────
+
+    def _check_auto_record(self):
+        """Called from audio callback to manage auto-record state."""
+        if not self.auto_record_enabled:
+            return
+
+        any_signal = any(
+            m.smoothed_rms >= NOISE_GATE_RMS and not m.is_dead
+            for m in self.mics.values()
+        )
+
+        now = time.time()
+
+        if any_signal:
+            self._last_signal_time = now
+            if not self.is_recording:
+                # Start auto-recording
+                self._auto_record_active = True
+                self.start_recording()
+                self._notify("auto_record_started")
+        elif self._auto_record_active and self.is_recording:
+            silence_duration = now - self._last_signal_time
+            all_dead = all(m.is_dead for m in self.mics.values())
+            if silence_duration >= self._auto_record_silence_timeout or all_dead:
+                self._auto_record_stop()
+
+    def _auto_record_stop(self):
+        if self._auto_record_active and self.is_recording:
+            self._auto_record_active = False
+            path = self.stop_recording()
+            self._notify("auto_record_stopped", {"path": path})
 
     # ── Internal ─────────────────────────────────────────────────
 
@@ -587,6 +581,16 @@ class AudioMixer:
             weights = self._mode.compute_weights(self.mics)
             self._mode.update_ui_state(self.mics, weights)
 
+            # Auto-record check
+            self._check_auto_record()
+
+            # External audio sink (for remote streaming)
+            if self._audio_sink is not None:
+                try:
+                    self._audio_sink(mono)
+                except Exception:
+                    pass
+
             # Recording: apply smoothed gain
             if self.is_recording:
                 target = weights.get(dev_idx, 0.0)
@@ -603,20 +607,16 @@ class AudioMixer:
                 arr = np.concatenate(chunks)
                 all_arrays[idx] = arr
                 max_len = max(max_len, len(arr))
-
         if not all_arrays or max_len == 0:
             return None
-
         mixed = np.zeros(max_len, dtype=np.float32)
         for arr in all_arrays.values():
             padded = np.zeros(max_len, dtype=np.float32)
             padded[:len(arr)] = arr
             mixed += padded
-
         peak = np.max(np.abs(mixed))
         if peak > 0:
             mixed = mixed / peak * 0.95
-
         ts = time.strftime("%Y%m%d_%H%M%S")
         output_path = os.path.join(self.recordings_dir, f"mixed_{ts}.wav")
         sf.write(output_path, mixed, SAMPLE_RATE)
